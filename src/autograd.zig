@@ -105,8 +105,14 @@ pub const Attention = struct {
         const K_t = try Val.transpose(allocator, K_r, &.{ 1, 0, 2 });
         const V_t = try Val.transpose(allocator, V_r, &.{ 1, 0, 2 });
 
-        const Q_rope = try Val.rope(allocator, Q_t, self.cos, self.sin);
-        const K_rope = try Val.rope(allocator, K_t, self.cos, self.sin);
+        // rope walks storage.data linearly and assumes [n_heads, seq, d_head]
+        // contiguous layout; Q_t/K_t are strided views over [seq, n_heads, d_head]
+        // storage, so they must be materialized contiguously first.
+        const Q_tc = try Val.contiguous(allocator, Q_t);
+        const K_tc = try Val.contiguous(allocator, K_t);
+
+        const Q_rope = try Val.rope(allocator, Q_tc, self.cos, self.sin);
+        const K_rope = try Val.rope(allocator, K_tc, self.cos, self.sin);
 
         const K_tt = try Val.transpose(allocator, K_rope, &.{ 0, 2, 1 });
         const qkt = try Val.matmul(allocator, Q_rope, K_tt);
@@ -142,8 +148,11 @@ pub fn attention(allocator: std.mem.Allocator, x: *Val, w_q: *Val, w_k: *Val, w_
     const K_t = try Val.transpose(allocator, K_r, &.{ 1, 0, 2 });
     const V_t = try Val.transpose(allocator, V_r, &.{ 1, 0, 2 });
 
-    const Q_rope = try Val.rope(allocator, Q_t, cos, sin);
-    const K_rope = try Val.rope(allocator, K_t, cos, sin);
+    const Q_tc = try Val.contiguous(allocator, Q_t);
+    const K_tc = try Val.contiguous(allocator, K_t);
+
+    const Q_rope = try Val.rope(allocator, Q_tc, cos, sin);
+    const K_rope = try Val.rope(allocator, K_tc, cos, sin);
 
     const K_tt = try Val.transpose(allocator, K_rope, &.{ 0, 2, 1 });
     const qkt = try Val.matmul(allocator, Q_rope, K_tt);
@@ -686,6 +695,9 @@ pub const Val = struct {
     }
 
     pub fn silu(allocator: std.mem.Allocator, x: *Val) !*Val {
+        std.debug.assert(x.value.isContiguous());
+        std.debug.assert(x.value.offset == 0 and x.value.storage.data.len == x.value.numel());
+
         var value = try Tensor.init(allocator, x.value.shape);
         errdefer value.deinit(allocator);
 
@@ -727,6 +739,9 @@ pub const Val = struct {
     }
 
     pub fn softmax(allocator: std.mem.Allocator, x: *Val) !*Val {
+        std.debug.assert(x.value.isContiguous());
+        std.debug.assert(x.value.offset == 0 and x.value.storage.data.len == x.value.numel());
+
         var value = try Tensor.init(allocator, x.value.shape);
         errdefer value.deinit(allocator);
 
@@ -772,6 +787,9 @@ pub const Val = struct {
     }
 
     pub fn logSoftmax(allocator: std.mem.Allocator, x: *Val) !*Val {
+        std.debug.assert(x.value.isContiguous());
+        std.debug.assert(x.value.offset == 0 and x.value.storage.data.len == x.value.numel());
+
         var value = try Tensor.init(allocator, x.value.shape);
         errdefer value.deinit(allocator);
 
@@ -1223,9 +1241,17 @@ pub const Val = struct {
         }
 
         if (!Tensor.shapeMatch(&target_grad.*.?, source)) return error.IncompatibleShapes;
-        for (0..source.numel()) |i| {
-            const existing = try target_grad.*.?.getFlat(i);
-            try target_grad.*.?.setFlat(i, existing + try source.getFlat(i));
+
+        const numel = source.numel();
+        const src_dense = source.isContiguous() and source.offset == 0 and source.storage.data.len == numel;
+        const dst_dense = target_grad.*.?.isContiguous() and target_grad.*.?.offset == 0 and target_grad.*.?.storage.data.len == numel;
+        if (src_dense and dst_dense) {
+            for (target_grad.*.?.storage.data, source.storage.data) |*t, s| t.* += s;
+        } else {
+            for (0..numel) |i| {
+                const existing = try target_grad.*.?.getFlat(i);
+                try target_grad.*.?.setFlat(i, existing + try source.getFlat(i));
+            }
         }
     }
 
@@ -1264,6 +1290,8 @@ pub const Val = struct {
 
     pub fn sumKeepdim(allocator: std.mem.Allocator, x: *Val, axis: usize) !*Val {
         if (axis >= x.value.shape.len) return error.InvalidAxis;
+        std.debug.assert(x.value.isContiguous());
+        std.debug.assert(x.value.offset == 0 and x.value.storage.data.len == x.value.numel());
 
         const out_shape = try allocator.alloc(usize, x.value.shape.len);
         defer allocator.free(out_shape);

@@ -20,7 +20,7 @@ const N_HEADS: usize = 4;
 const D_FFN: usize = 1024;
 const N_LAYERS: usize = 6;
 const SEQ_LEN: usize = 512;
-const BATCH_SIZE: usize = 1;
+const BATCH_SIZE: usize = 4;
 const LR: f32 = 3e-4;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
@@ -363,7 +363,8 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io) !void {
     defer allocator.free(sys_tokens);
     try context.appendSlice(allocator, sys_tokens);
 
-    var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+    const seed: u64 = @bitCast(@as(i64, @truncate(std.Io.Timestamp.now(io, .awake).nanoseconds)));
+    var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
     var line_buf: [2048]u8 = undefined;
@@ -372,7 +373,7 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io) !void {
         std.debug.print("You: ", .{});
 
         const line = readLine(&line_buf) orelse break;
-        const trimmed = std.mem.trimRight(u8, line, " ");
+        const trimmed = std.mem.trimEnd(u8, line, " ");
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "quit") or std.mem.eql(u8, trimmed, "exit")) break;
 
