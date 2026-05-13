@@ -10,7 +10,7 @@ sys_include_dir=/usr/include
 # The directory that contains `crt1.o` or `crt2.o`.
 # On POSIX, can be found with `cc -print-file-name=crt1.o`.
 # Not needed when targeting MacOS.
-crt_dir=/home/phagmaier/Desktop/Code/Ai/crt
+crt_dir=/home/phagmaier/Desktop/Code/Zlm/crt
 
 # The directory that contains `vcruntime.lib`.
 # Only needed when targeting MSVC on Windows.

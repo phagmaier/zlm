@@ -51,8 +51,8 @@ pub fn main(init: std.process.Init) !void {
         try runTrain(allocator, io);
     } else if (std.mem.eql(u8, subcommand, "save")) {
         try runSave(allocator, io);
-    } else if (std.mem.eql(u8, subcommand, "load")) {
-        try runLoad(allocator, io);
+    } else if (std.mem.eql(u8, subcommand, "chat")) {
+        try runChat(allocator, io);
     } else if (std.mem.eql(u8, subcommand, "sample")) {
         const prompt = if (args.len > 2) std.mem.span(args[2]) else null;
         try runSample(allocator, io, prompt);
@@ -68,7 +68,7 @@ fn usage() void {
     std.debug.print("  tokenize: Train BPE and encode corpus\n", .{});
     std.debug.print("  train:    Run the training loop\n", .{});
     std.debug.print("  save:     Initialize model and save weights\n", .{});
-    std.debug.print("  load:     Initialize model and load weights\n", .{});
+    std.debug.print("  chat:     Load model and chat interactively\n", .{});
     std.debug.print("  sample:   [prompt] Generate text from model\n", .{});
 }
 
@@ -243,13 +243,6 @@ fn runSave(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("Model weights saved to {s}\n", .{WEIGHTS_PATH});
 }
 
-fn runLoad(allocator: std.mem.Allocator, io: std.Io) !void {
-    var model = try Model.init(allocator, VOCAB_SIZE, D_MODEL, N_HEADS, D_FFN, N_LAYERS, SEQ_LEN, 42);
-    defer model.deinit(allocator);
-    try ag.loadWeights(&model, io, WEIGHTS_PATH);
-    std.debug.print("Model weights loaded from {s}\n", .{WEIGHTS_PATH});
-}
-
 fn runSample(allocator: std.mem.Allocator, io: std.Io, opt_prompt: ?[]const u8) !void {
     const merges = try Tokenizer.loadMerges(allocator, io, SAVED_BIN);
     defer allocator.free(merges);
@@ -332,6 +325,117 @@ fn runSample(allocator: std.mem.Allocator, io: std.Io, opt_prompt: ?[]const u8) 
         std.debug.print("{s}", .{words.data[sampled_token]});
     }
     std.debug.print("\n", .{});
+}
+
+fn readLine(buf: []u8) ?[]u8 {
+    var len: usize = 0;
+    while (len < buf.len) {
+        var byte: [1]u8 = undefined;
+        const n = std.posix.read(0, &byte) catch return null;
+        if (n == 0) return null;
+        if (byte[0] == '\n') break;
+        if (byte[0] != '\r') {
+            buf[len] = byte[0];
+            len += 1;
+        }
+    }
+    return buf[0..len];
+}
+
+fn runChat(allocator: std.mem.Allocator, io: std.Io) !void {
+    const merges = try Tokenizer.loadMerges(allocator, io, SAVED_BIN);
+    defer allocator.free(merges);
+    var words = try Tokenizer.Words.fromMerges(allocator, merges);
+    defer words.deinit();
+    var encoder = try Tokenizer.Encoder.init(allocator, merges);
+    defer encoder.deinit();
+
+    var model = try Model.init(allocator, VOCAB_SIZE, D_MODEL, N_HEADS, D_FFN, N_LAYERS, SEQ_LEN, 42);
+    defer model.deinit(allocator);
+    try ag.loadWeights(&model, io, WEIGHTS_PATH);
+
+    std.debug.print("Assistant ready. Type your message and press Enter ('quit' to exit).\n\n", .{});
+
+    var context: std.ArrayList(u16) = .empty;
+    defer context.deinit(allocator);
+
+    const sys_tokens = try encoder.encode(allocator, "<|system|>You are a helpful assistant.");
+    defer allocator.free(sys_tokens);
+    try context.appendSlice(allocator, sys_tokens);
+
+    var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
+    const rng = prng.random();
+
+    var line_buf: [2048]u8 = undefined;
+
+    while (true) {
+        std.debug.print("You: ", .{});
+
+        const line = readLine(&line_buf) orelse break;
+        const trimmed = std.mem.trimRight(u8, line, " ");
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, "quit") or std.mem.eql(u8, trimmed, "exit")) break;
+
+        const user_text = try std.fmt.allocPrint(allocator, "<|user|>{s}<|assistant|>", .{trimmed});
+        defer allocator.free(user_text);
+        const user_tokens = try encoder.encode(allocator, user_text);
+        defer allocator.free(user_tokens);
+        try context.appendSlice(allocator, user_tokens);
+
+        std.debug.print("Assistant: ", .{});
+
+        var i: usize = 0;
+        while (i < 512) : (i += 1) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const ga = arena.allocator();
+
+            const cur_len = context.items.len;
+            const ctx_start = if (cur_len > SEQ_LEN) cur_len - SEQ_LEN else 0;
+            const ctx = context.items[ctx_start..];
+
+            const mask_tensor = try ag.causalMask(ga, ctx.len);
+            const mask = try Val.makeLeaf(ga, &mask_tensor);
+            const result = try model.forward(ga, ctx, mask);
+
+            const last_logits = try ga.alloc(f32, VOCAB_SIZE);
+            const vocab_start = (ctx.len - 1) * VOCAB_SIZE;
+            @memcpy(last_logits, result.out.value.storage.data[vocab_start .. vocab_start + VOCAB_SIZE]);
+
+            for (last_logits) |*l| l.* /= 0.8;
+            try topK(ga, last_logits, 40);
+
+            var max_val: f32 = last_logits[0];
+            for (last_logits) |l| if (l > max_val) { max_val = l; };
+            var sum: f32 = 0;
+            for (last_logits) |*l| {
+                l.* = @exp(l.* - max_val);
+                sum += l.*;
+            }
+            for (last_logits) |*l| l.* /= sum;
+
+            const r = rng.float(f32);
+            var acc: f32 = 0;
+            var next_token: u16 = 0;
+            for (last_logits, 0..) |p, idx| {
+                acc += p;
+                if (r < acc) {
+                    next_token = @intCast(idx);
+                    break;
+                }
+            } else {
+                next_token = @intCast(last_logits.len - 1);
+            }
+
+            try context.append(allocator, next_token);
+            if (next_token < Tokenizer.SPECIAL_TOKENS.len) break;
+            std.debug.print("{s}", .{words.data[next_token]});
+        }
+
+        std.debug.print("\n\n", .{});
+    }
+
+    std.debug.print("Goodbye!\n", .{});
 }
 
 fn topK(allocator: std.mem.Allocator, logits: []f32, k: usize) !void {
