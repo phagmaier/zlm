@@ -114,8 +114,8 @@ pub const Attention = struct {
         const Q_rope = try Val.rope(allocator, Q_tc, self.cos, self.sin);
         const K_rope = try Val.rope(allocator, K_tc, self.cos, self.sin);
 
-        const K_tt = try Val.transpose(allocator, K_rope, &.{ 0, 2, 1 });
-        const qkt = try Val.matmul(allocator, Q_rope, K_tt);
+        // QK^T via BLAS transpose flag — no K_tt materialization.
+        const qkt = try Val.matmulT(allocator, Q_rope, K_rope, false, true);
         const scaled = try Val.mulScalar(allocator, qkt, inv_sqrt);
         const masked = try Val.add(allocator, scaled, mask);
         const weights = try Val.softmax(allocator, masked);

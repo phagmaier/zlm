@@ -56,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, subcommand, "sample")) {
         const prompt = if (args.len > 2) std.mem.span(args[2]) else null;
         try runSample(allocator, io, prompt);
+    } else if (std.mem.eql(u8, subcommand, "bench")) {
+        try runBench(allocator, io);
     } else {
         usage();
         std.process.exit(1);
@@ -70,6 +72,7 @@ fn usage() void {
     std.debug.print("  save:     Initialize model and save weights\n", .{});
     std.debug.print("  chat:     Load model and chat interactively\n", .{});
     std.debug.print("  sample:   [prompt] Generate text from model\n", .{});
+    std.debug.print("  bench:    Run a few training steps and print per-phase timings\n", .{});
 }
 
 fn runTokenize(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -234,6 +237,122 @@ fn runTrain(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("Training complete. Saving weights to {s}...\n", .{WEIGHTS_PATH});
     try saveCheckpoint(&model, &optimizer, io, step);
     try ag.saveWeights(&model, io, WEIGHTS_PATH);
+}
+
+// Runs a small number of training steps with per-phase timing and prints a
+// breakdown. No checkpointing, no weight saving — purely for profiling.
+fn runBench(allocator: std.mem.Allocator, io: std.Io) !void {
+    const BENCH_STEPS: usize = 6;
+
+    const corpus_file = try std.Io.Dir.cwd().openFile(io, ENCODED_BIN, .{ .mode = .read_only });
+    defer corpus_file.close(io);
+    const file_size = (try corpus_file.stat(io)).size;
+    const mapped = try std.posix.mmap(null, @intCast(file_size), .{ .READ = true }, .{ .TYPE = .PRIVATE }, corpus_file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const corpus = std.mem.bytesAsSlice(u16, mapped[8..]);
+
+    var model = try Model.init(allocator, VOCAB_SIZE, D_MODEL, N_HEADS, D_FFN, N_LAYERS, SEQ_LEN, 42);
+    defer model.deinit(allocator);
+
+    var param_list: std.ArrayList(*Tensor) = .empty;
+    defer param_list.deinit(allocator);
+    var grad_list: std.ArrayList(*?Tensor) = .empty;
+    defer grad_list.deinit(allocator);
+    try model.collectParams(allocator, &param_list, &grad_list);
+
+    var optimizer = try AdamW.init(allocator, param_list.items, grad_list.items, LR, BETA1, BETA2, EPS, WEIGHT_DECAY);
+    defer optimizer.deinit(allocator);
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const rng = prng.random();
+
+    var t_zero_ns: u64 = 0;
+    var t_forward_ns: u64 = 0;
+    var t_backward_ns: u64 = 0;
+    var t_accum_ns: u64 = 0;
+    var t_avg_ns: u64 = 0;
+    var t_clip_ns: u64 = 0;
+    var t_step_ns: u64 = 0;
+
+    const wall_start = std.Io.Timestamp.now(io, .awake);
+
+    var step: usize = 0;
+    while (step < BENCH_STEPS) : (step += 1) {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        model.zeroGrads(allocator);
+        const t1 = std.Io.Timestamp.now(io, .awake);
+        t_zero_ns += @intCast(t0.durationTo(t1).nanoseconds);
+
+        for (0..BATCH_SIZE) |_| {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const ga = arena.allocator();
+
+            const max_start = corpus.len - SEQ_LEN - 1;
+            const start = rng.uintLessThan(usize, max_start);
+            const input_ids = corpus[start .. start + SEQ_LEN];
+            const target_ids = corpus[start + 1 .. start + SEQ_LEN + 1];
+
+            const mask_tensor = try ag.causalMask(ga, SEQ_LEN);
+            const mask = try Val.makeLeaf(ga, &mask_tensor);
+
+            const tf0 = std.Io.Timestamp.now(io, .awake);
+            const result = try model.forward(ga, input_ids, mask);
+            const loss = try Val.crossEntropy(ga, result.out, target_ids);
+            const tf1 = std.Io.Timestamp.now(io, .awake);
+            t_forward_ns += @intCast(tf0.durationTo(tf1).nanoseconds);
+
+            try Val.backward(ga, loss);
+            const tf2 = std.Io.Timestamp.now(io, .awake);
+            t_backward_ns += @intCast(tf1.durationTo(tf2).nanoseconds);
+
+            try model.accumulateGrads(allocator, &result);
+            const tf3 = std.Io.Timestamp.now(io, .awake);
+            t_accum_ns += @intCast(tf2.durationTo(tf3).nanoseconds);
+        }
+
+        const ta0 = std.Io.Timestamp.now(io, .awake);
+        for (grad_list.items) |grad_slot| {
+            if (grad_slot.*) |*grad| {
+                for (grad.storage.data) |*v| {
+                    v.* /= @as(f32, @floatFromInt(BATCH_SIZE));
+                }
+            }
+        }
+        const ta1 = std.Io.Timestamp.now(io, .awake);
+        t_avg_ns += @intCast(ta0.durationTo(ta1).nanoseconds);
+
+        clipGrads(grad_list.items, GRAD_CLIP);
+        const ta2 = std.Io.Timestamp.now(io, .awake);
+        t_clip_ns += @intCast(ta1.durationTo(ta2).nanoseconds);
+
+        optimizer.lr = getLR(step, WARMUP_STEPS, N_STEPS, LR, MIN_LR);
+        try optimizer.step();
+        const ta3 = std.Io.Timestamp.now(io, .awake);
+        t_step_ns += @intCast(ta2.durationTo(ta3).nanoseconds);
+    }
+
+    const wall_end = std.Io.Timestamp.now(io, .awake);
+    const wall_ns: u64 = @intCast(wall_start.durationTo(wall_end).nanoseconds);
+    const steps_f: f64 = @floatFromInt(BENCH_STEPS);
+    const wall_s = @as(f64, @floatFromInt(wall_ns)) / 1e9;
+    const sps = steps_f / wall_s;
+
+    const per_step_ms = struct {
+        fn f(ns: u64, n: f64) f64 {
+            return (@as(f64, @floatFromInt(ns)) / 1e6) / n;
+        }
+    }.f;
+
+    std.debug.print("\n=== Bench: {d} steps, wall {d:.2}s, {d:.3} steps/s ===\n", .{ BENCH_STEPS, wall_s, sps });
+    std.debug.print("Per-step phase timings (ms):\n", .{});
+    std.debug.print("  zeroGrads:       {d:.1}\n", .{per_step_ms(t_zero_ns, steps_f)});
+    std.debug.print("  forward+CE:      {d:.1}\n", .{per_step_ms(t_forward_ns, steps_f)});
+    std.debug.print("  backward:        {d:.1}\n", .{per_step_ms(t_backward_ns, steps_f)});
+    std.debug.print("  accumulateGrads: {d:.1}\n", .{per_step_ms(t_accum_ns, steps_f)});
+    std.debug.print("  batch avg:       {d:.1}\n", .{per_step_ms(t_avg_ns, steps_f)});
+    std.debug.print("  gradClip:        {d:.1}\n", .{per_step_ms(t_clip_ns, steps_f)});
+    std.debug.print("  AdamW.step:      {d:.1}\n", .{per_step_ms(t_step_ns, steps_f)});
 }
 
 fn runSave(allocator: std.mem.Allocator, io: std.Io) !void {

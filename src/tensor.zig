@@ -410,8 +410,42 @@ pub const Tensor = struct {
             return out;
         }
 
-        for (0..n) |i| {
-            out[i] = try self.getFlat(i);
+        // Non-contiguous: walk strides incrementally instead of div/mod per element.
+        if (n == 0) return out;
+
+        const rank = self.shape.len;
+        if (rank == 0) {
+            out[0] = try self.getFlat(0);
+            return out;
+        }
+
+        const data = self.storage.data;
+        const shape = self.shape;
+        const strides = self.strides;
+        const coords = try allocator.alloc(usize, rank);
+        defer allocator.free(coords);
+        @memset(coords, 0);
+
+        var offset = self.offset;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const idx = std.math.cast(usize, offset) orelse return TensorErrs.AccessDenied;
+            if (idx >= data.len) return TensorErrs.AccessDenied;
+            out[i] = data[idx];
+
+            // Increment coords from the innermost axis and update offset.
+            var axis = rank;
+            while (axis > 0) {
+                axis -= 1;
+                coords[axis] += 1;
+                if (coords[axis] < shape[axis]) {
+                    offset += strides[axis];
+                    break;
+                }
+                // Roll over this axis: subtract everything we added on this axis.
+                offset -= strides[axis] * @as(isize, @intCast(shape[axis] - 1));
+                coords[axis] = 0;
+            }
         }
 
         return out;
