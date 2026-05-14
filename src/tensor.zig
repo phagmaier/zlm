@@ -366,6 +366,25 @@ pub const Tensor = struct {
         return self.storage.data[storage_index];
     }
 
+    /// If the tensor is contiguous in memory, return the backing slice for its
+    /// logical elements (length == numel). Otherwise return null. Callers should
+    /// use this to bypass strided indexing in hot loops.
+    pub fn contiguousSlice(self: *const Tensor) ?[]const f32 {
+        if (!self.isContiguous()) return null;
+        const base = std.math.cast(usize, self.offset) orelse return null;
+        const n = self.numel();
+        if (base + n > self.storage.data.len) return null;
+        return self.storage.data[base .. base + n];
+    }
+
+    pub fn contiguousSliceMut(self: *Tensor) ?[]f32 {
+        if (!self.isContiguous()) return null;
+        const base = std.math.cast(usize, self.offset) orelse return null;
+        const n = self.numel();
+        if (base + n > self.storage.data.len) return null;
+        return self.storage.data[base .. base + n];
+    }
+
     pub fn get(self: *const Tensor, indices: []const usize) !f32 {
         const storage_index = try self.storageIndexFromIndices(indices);
         return self.storage.data[storage_index];
@@ -382,10 +401,16 @@ pub const Tensor = struct {
     }
 
     pub fn toOwnedSlice(self: *const Tensor, allocator: std.mem.Allocator) ![]f32 {
-        const out = try allocator.alloc(f32, self.numel());
+        const n = self.numel();
+        const out = try allocator.alloc(f32, n);
         errdefer allocator.free(out);
 
-        for (0..self.numel()) |i| {
+        if (self.contiguousSlice()) |src| {
+            @memcpy(out, src);
+            return out;
+        }
+
+        for (0..n) |i| {
             out[i] = try self.getFlat(i);
         }
 
@@ -704,7 +729,13 @@ pub const Tensor = struct {
         var new = try Tensor.init(allocator, tensor.shape);
         errdefer new.deinit(allocator);
 
-        for (0..tensor.numel()) |i| {
+        const n = tensor.numel();
+        if (tensor.contiguousSlice()) |src| {
+            for (0..n) |i| new.storage.data[i] = src[i] + scalar;
+            return new;
+        }
+
+        for (0..n) |i| {
             new.storage.data[i] = try tensor.getFlat(i) + scalar;
         }
         return new;
@@ -714,7 +745,13 @@ pub const Tensor = struct {
         var new = try Tensor.init(allocator, tensor.shape);
         errdefer new.deinit(allocator);
 
-        for (0..tensor.numel()) |i| {
+        const n = tensor.numel();
+        if (tensor.contiguousSlice()) |src| {
+            for (0..n) |i| new.storage.data[i] = src[i] * scalar;
+            return new;
+        }
+
+        for (0..n) |i| {
             new.storage.data[i] = try tensor.getFlat(i) * scalar;
         }
         return new;
@@ -725,8 +762,13 @@ pub const Tensor = struct {
         errdefer out.deinit(allocator);
 
         var total: f32 = 0.0;
-        for (0..tensor.numel()) |i| {
-            total += try tensor.getFlat(i);
+        const n = tensor.numel();
+        if (tensor.contiguousSlice()) |src| {
+            for (0..n) |i| total += src[i];
+        } else {
+            for (0..n) |i| {
+                total += try tensor.getFlat(i);
+            }
         }
         out.storage.data[0] = total;
         return out;
@@ -804,26 +846,15 @@ pub const Tensor = struct {
 
     pub fn matmul(allocator: std.mem.Allocator, l: *const Tensor, r: *const Tensor, transpose_left: bool, transpose_right: bool) !Tensor {
         if (l.shape.len == 0 or r.shape.len == 0) return TensorErrs.UnsupportedRank;
+        if (transpose_left and l.shape.len < 2) return TensorErrs.UnsupportedRank;
+        if (transpose_right and r.shape.len < 2) return TensorErrs.UnsupportedRank;
 
-        // Fallback for transpose: materialize the transpose in Zig memory first.
-        // This avoids complex BLAS transpose flag issues while still being much faster than nested loops.
+        // Transposes are handled by BLAS flags (CblasTrans), not by materializing
+        // a permuted copy. We only materialize when an input isn't contiguous in
+        // its own logical row-major layout.
         var left_tmp: ?Tensor = null;
         defer if (left_tmp) |*t| t.deinit(allocator);
-        const left = if (transpose_left) blk: {
-            const rank = l.shape.len;
-            if (rank < 2) return TensorErrs.UnsupportedRank;
-            var perm = try allocator.alloc(usize, rank);
-            defer allocator.free(perm);
-            for (0..rank - 2) |i| perm[i] = i;
-            perm[rank - 2] = rank - 1;
-            perm[rank - 1] = rank - 2;
-
-            var t = try Tensor.transpose(allocator, l, perm);
-            errdefer t.deinit(allocator);
-            left_tmp = try t.contiguous(allocator);
-            t.deinit(allocator);
-            break :blk &left_tmp.?;
-        } else blk: {
+        const left = blk: {
             if (l.isContiguous()) break :blk l;
             left_tmp = try l.contiguous(allocator);
             break :blk &left_tmp.?;
@@ -831,21 +862,7 @@ pub const Tensor = struct {
 
         var right_tmp: ?Tensor = null;
         defer if (right_tmp) |*t| t.deinit(allocator);
-        const right = if (transpose_right) blk: {
-            const rank = r.shape.len;
-            if (rank < 2) return TensorErrs.UnsupportedRank;
-            var perm = try allocator.alloc(usize, rank);
-            defer allocator.free(perm);
-            for (0..rank - 2) |i| perm[i] = i;
-            perm[rank - 2] = rank - 1;
-            perm[rank - 1] = rank - 2;
-
-            var t = try Tensor.transpose(allocator, r, perm);
-            errdefer t.deinit(allocator);
-            right_tmp = try t.contiguous(allocator);
-            t.deinit(allocator);
-            break :blk &right_tmp.?;
-        } else blk: {
+        const right = blk: {
             if (r.isContiguous()) break :blk r;
             right_tmp = try r.contiguous(allocator);
             break :blk &right_tmp.?;
@@ -854,12 +871,23 @@ pub const Tensor = struct {
         const left_promoted = left.shape.len == 1;
         const right_promoted = right.shape.len == 1;
 
-        const m = if (left_promoted) 1 else left.shape[left.shape.len - 2];
-        const k = left.shape[left.shape.len - 1];
-        const right_k = if (right_promoted) right.shape[0] else right.shape[right.shape.len - 2];
-        const n = if (right_promoted) 1 else right.shape[right.shape.len - 1];
+        // Physical (stored) row/col counts for the matrix part of each input.
+        const l_phys_rows: usize = if (left_promoted) 1 else left.shape[left.shape.len - 2];
+        const l_phys_cols: usize = left.shape[left.shape.len - 1];
+        const r_phys_rows: usize = if (right_promoted) 1 else right.shape[right.shape.len - 2];
+        const r_phys_cols: usize = right.shape[right.shape.len - 1];
 
-        if (k != right_k) return TensorErrs.IncompatibleShapes;
+        // Logical (post-transpose) dims. Promoted (1D) operands cannot be transposed.
+        const apply_trans_left = transpose_left and !left_promoted;
+        const apply_trans_right = transpose_right and !right_promoted;
+
+        const m = if (left_promoted) 1 else if (apply_trans_left) l_phys_cols else l_phys_rows;
+        const k_left = if (left_promoted) l_phys_cols else if (apply_trans_left) l_phys_rows else l_phys_cols;
+        const k_right = if (right_promoted) r_phys_cols else if (apply_trans_right) r_phys_cols else r_phys_rows;
+        const n = if (right_promoted) 1 else if (apply_trans_right) r_phys_rows else r_phys_cols;
+        const k = k_left;
+
+        if (k_left != k_right) return TensorErrs.IncompatibleShapes;
 
         const left_batch_shape = batchShapeForMatmul(left.shape, left_promoted);
         const right_batch_shape = batchShapeForMatmul(right.shape, right_promoted);
@@ -907,8 +935,19 @@ pub const Tensor = struct {
         const left_base = try checkedOffsetToIndex(left.offset);
         const right_base = try checkedOffsetToIndex(right.offset);
 
-        const lda = ck;
-        const ldb = cn;
+        // Leading dims are the row stride of each operand as BLAS sees it.
+        // For a 1D right operand interpreted as a (k x 1) column, the stride is 1.
+        const lda = try checkedCastToCInt(l_phys_cols);
+        const ldb = try checkedCastToCInt(if (right_promoted) @as(usize, 1) else r_phys_cols);
+
+        const trans_a: cblas.CBLAS_TRANSPOSE = if (apply_trans_left)
+            @intCast(cblas.CblasTrans)
+        else
+            @intCast(cblas.CblasNoTrans);
+        const trans_b: cblas.CBLAS_TRANSPOSE = if (apply_trans_right)
+            @intCast(cblas.CblasTrans)
+        else
+            @intCast(cblas.CblasNoTrans);
 
         for (0..batch_count) |batch_idx| {
             const left_offset = if (out_batch_shape.len == 0)
@@ -926,8 +965,8 @@ pub const Tensor = struct {
 
             cblas.cblas_sgemm(
                 @as(cblas.CBLAS_ORDER, @intCast(cblas.CblasRowMajor)),
-                @as(cblas.CBLAS_TRANSPOSE, @intCast(cblas.CblasNoTrans)),
-                @as(cblas.CBLAS_TRANSPOSE, @intCast(cblas.CblasNoTrans)),
+                trans_a,
+                trans_b,
                 cm,
                 cn,
                 ck,

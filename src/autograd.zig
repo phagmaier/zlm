@@ -937,9 +937,18 @@ pub const Val = struct {
         var out = try Tensor.zeroes(allocator, shape);
         errdefer out.deinit(allocator);
 
+        const n = grad.numel();
+        const grad_src = grad.contiguousSlice();
+
         if (shape.len == 0) {
-            for (0..grad.numel()) |i| {
-                out.storage.data[0] += try grad.getFlat(i);
+            if (grad_src) |src| {
+                var total: f32 = 0.0;
+                for (0..n) |i| total += src[i];
+                out.storage.data[0] += total;
+            } else {
+                for (0..n) |i| {
+                    out.storage.data[0] += try grad.getFlat(i);
+                }
             }
             return out;
         }
@@ -949,7 +958,7 @@ pub const Val = struct {
         const out_strides = try logicalStrides(allocator, shape);
         defer allocator.free(out_strides);
 
-        for (0..grad.numel()) |linear| {
+        for (0..n) |linear| {
             var remaining = linear;
             var out_linear: usize = 0;
 
@@ -964,7 +973,8 @@ pub const Val = struct {
                 out_linear += out_coord * out_strides[out_axis];
             }
 
-            out.storage.data[out_linear] += try grad.getFlat(linear);
+            const val = if (grad_src) |src| src[linear] else try grad.getFlat(linear);
+            out.storage.data[out_linear] += val;
         }
 
         return out;
@@ -976,8 +986,17 @@ pub const Val = struct {
         }
         if (!Tensor.shapeMatch(&target.grad.?, contribution)) return error.IncompatibleShapes;
 
-        for (0..contribution.numel()) |i| {
-            target.grad.?.storage.data[i] += try contribution.getFlat(i);
+        const n = contribution.numel();
+        // target.grad is freshly allocated by Tensor.zeroes (offset 0, contiguous),
+        // so its storage.data is the dense buffer we want to write to.
+        const dst = target.grad.?.storage.data;
+        if (contribution.contiguousSlice()) |src| {
+            for (0..n) |i| dst[i] += src[i];
+            return;
+        }
+
+        for (0..n) |i| {
+            dst[i] += try contribution.getFlat(i);
         }
     }
 
@@ -1301,21 +1320,36 @@ pub const Val = struct {
         var value = try Tensor.zeroes(allocator, out_shape);
         errdefer value.deinit(allocator);
 
-        const in_strides = try logicalStrides(allocator, x.value.shape);
-        defer allocator.free(in_strides);
-        const out_strides = try logicalStrides(allocator, out_shape);
-        defer allocator.free(out_strides);
+        const shape = x.value.shape;
+        const x_data = x.value.storage.data;
+        const out_data = value.storage.data;
 
-        for (0..x.value.numel()) |linear_in| {
-            var remaining = linear_in;
-            var linear_out: usize = 0;
-            for (0..x.value.shape.len) |i| {
-                const coord = remaining / in_strides[i];
-                remaining %= in_strides[i];
-                const out_coord = if (i == axis) 0 else coord;
-                linear_out += out_coord * out_strides[i];
+        // Layout: outer = product(shape[0..axis]), mid = shape[axis], inner = product(shape[axis+1..]).
+        var outer: usize = 1;
+        for (0..axis) |i| outer *= shape[i];
+        const mid = shape[axis];
+        var inner: usize = 1;
+        for (axis + 1..shape.len) |i| inner *= shape[i];
+
+        if (inner == 1) {
+            // Reducing over the last axis: tight inner loop.
+            for (0..outer) |o| {
+                var total: f32 = 0.0;
+                const base = o * mid;
+                for (0..mid) |m| total += x_data[base + m];
+                out_data[o] = total;
             }
-            value.storage.data[linear_out] += x.value.storage.data[linear_in];
+        } else {
+            for (0..outer) |o| {
+                const out_base = o * inner;
+                const in_base = o * mid * inner;
+                for (0..mid) |m| {
+                    const row = in_base + m * inner;
+                    for (0..inner) |i| {
+                        out_data[out_base + i] += x_data[row + i];
+                    }
+                }
+            }
         }
 
         const parents = try allocator.alloc(*Val, 1);
@@ -1438,24 +1472,57 @@ pub const AdamW = struct {
         const one_minus_beta1_t = 1.0 - std.math.pow(f32, self.beta1, @floatFromInt(self.t));
         const one_minus_beta2_t = 1.0 - std.math.pow(f32, self.beta2, @floatFromInt(self.t));
 
+        const beta1 = self.beta1;
+        const beta2 = self.beta2;
+        const one_minus_beta1 = 1.0 - beta1;
+        const one_minus_beta2 = 1.0 - beta2;
+        const lr = self.lr;
+        const eps = self.eps;
+        const wd = self.weight_decay;
+
         for (self.params, self.grads, self.ms, self.vs) |param, grad_slot, *m, *v| {
             const grad = if (grad_slot.*) |*g| g else continue;
             if (!Tensor.shapeMatch(param, grad) or !Tensor.shapeMatch(param, m) or !Tensor.shapeMatch(param, v)) {
                 return error.IncompatibleShapes;
             }
 
-            for (0..param.numel()) |i| {
-                const g = try grad.getFlat(i);
-                const p = param.storage.data[i];
+            const n = param.numel();
+            const p_data = param.storage.data;
+            const m_data = m.storage.data;
+            const v_data = v.storage.data;
 
-                m.storage.data[i] = self.beta1 * m.storage.data[i] + (1.0 - self.beta1) * g;
-                v.storage.data[i] = self.beta2 * v.storage.data[i] + (1.0 - self.beta2) * g * g;
+            if (grad.contiguousSlice()) |g_data| {
+                for (0..n) |i| {
+                    const g = g_data[i];
+                    const p = p_data[i];
 
-                const m_hat = m.storage.data[i] / one_minus_beta1_t;
-                const v_hat = v.storage.data[i] / one_minus_beta2_t;
-                const update = (m_hat / (@sqrt(v_hat) + self.eps)) + self.weight_decay * p;
+                    const new_m = beta1 * m_data[i] + one_minus_beta1 * g;
+                    const new_v = beta2 * v_data[i] + one_minus_beta2 * g * g;
+                    m_data[i] = new_m;
+                    v_data[i] = new_v;
 
-                param.storage.data[i] = p - self.lr * update;
+                    const m_hat = new_m / one_minus_beta1_t;
+                    const v_hat = new_v / one_minus_beta2_t;
+                    const update = (m_hat / (@sqrt(v_hat) + eps)) + wd * p;
+
+                    p_data[i] = p - lr * update;
+                }
+            } else {
+                for (0..n) |i| {
+                    const g = try grad.getFlat(i);
+                    const p = p_data[i];
+
+                    const new_m = beta1 * m_data[i] + one_minus_beta1 * g;
+                    const new_v = beta2 * v_data[i] + one_minus_beta2 * g * g;
+                    m_data[i] = new_m;
+                    v_data[i] = new_v;
+
+                    const m_hat = new_m / one_minus_beta1_t;
+                    const v_hat = new_v / one_minus_beta2_t;
+                    const update = (m_hat / (@sqrt(v_hat) + eps)) + wd * p;
+
+                    p_data[i] = p - lr * update;
+                }
             }
         }
     }
