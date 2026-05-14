@@ -30,7 +30,7 @@ const N_STEPS: usize = 300000;
 const LOG_EVERY: usize = 100;
 const WARMUP_STEPS: usize = 1000;
 const CHECKPOINT_EVERY: usize = 1000;
-const MIN_LR: f32 = LR * 0.1;
+const MIN_LR: f32 = LR * 0.2;
 
 pub fn main(init: std.process.Init) !void {
     const args = init.minimal.args.vector;
@@ -608,7 +608,7 @@ fn getLR(step: usize, warmup_steps: usize, total_steps: usize, max_lr: f32, min_
     const f_total: f32 = @floatFromInt(total_steps);
 
     if (step < warmup_steps) {
-        return max_lr * (f_step / f_warmup);
+        return max_lr * ((f_step + 1.0) / f_warmup);
     } else {
         const progress = (f_step - f_warmup) / (f_total - f_warmup);
         return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + @cos(std.math.pi * progress));
